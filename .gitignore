@@ -12,6 +12,7 @@ frontend/coverage/
 frontend/.vite/
 .review-build/
 .env
+.env.aws
 .pytest_cache/
 *.pyc
 __pycache__/

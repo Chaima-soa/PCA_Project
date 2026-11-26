@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from sqlalchemy.orm import Session
 
 from app.auth import can_access_department, require_permission
@@ -152,6 +157,51 @@ def _storage_root() -> Path:
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _attachments_bucket() -> str | None:
+    return os.getenv('ATTACHMENTS_BUCKET', '').strip() or None
+
+
+@lru_cache(maxsize=1)
+def _s3_client():
+    region = os.getenv('AWS_REGION') or os.getenv('AWS_DEFAULT_REGION')
+    return boto3.client('s3', region_name=region or None)
+
+
+def _attachment_object_key(storage_name: str) -> str:
+    return f'attachments/{storage_name}'
+
+
+def _store_attachment(storage_name: str, content: bytes, content_type: str | None) -> None:
+    bucket = _attachments_bucket()
+    if bucket:
+        try:
+            _s3_client().put_object(
+                Bucket=bucket,
+                Key=_attachment_object_key(storage_name),
+                Body=content,
+                ContentType=content_type or 'application/octet-stream',
+            )
+        except (BotoCoreError, ClientError) as exc:
+            raise HTTPException(status_code=503, detail='Attachment storage is unavailable') from exc
+        return
+
+    root = _storage_root()
+    destination = (root / storage_name).resolve()
+    if destination.parent != root:
+        raise HTTPException(status_code=400, detail='Invalid attachment path')
+    destination.write_bytes(content)
+
+
+def _delete_s3_attachment(storage_name: str) -> None:
+    bucket = _attachments_bucket()
+    if not bucket:
+        return
+    try:
+        _s3_client().delete_object(Bucket=bucket, Key=_attachment_object_key(storage_name))
+    except (BotoCoreError, ClientError) as exc:
+        raise HTTPException(status_code=503, detail='Attachment storage is unavailable') from exc
 
 
 @router.get('/activity-dependencies')
@@ -442,10 +492,7 @@ async def upload_attachment(
     if len(content) > MAX_ATTACHMENT_BYTES:
         raise HTTPException(status_code=413, detail='Attachment is too large')
     storage_name = f'{uuid4().hex}{extension}'
-    destination = (_storage_root() / storage_name).resolve()
-    if destination.parent != _storage_root():
-        raise HTTPException(status_code=400, detail='Invalid attachment path')
-    destination.write_bytes(content)
+    _store_attachment(storage_name, content, file.content_type)
     item = RiskAttachment(
         risk_id=risk.id,
         uploaded_by_id=current_user.id,
@@ -467,10 +514,35 @@ def download_attachment(
     attachment_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permission('risks:read')),
-) -> FileResponse:
+):
     item = db.query(RiskAttachment).filter(RiskAttachment.id == attachment_id).first()
     if item is None or not can_access_department(current_user, item.risk.department_id):
         raise HTTPException(status_code=404, detail='Attachment not found')
+
+    bucket = _attachments_bucket()
+    if bucket:
+        try:
+            stored_object = _s3_client().get_object(
+                Bucket=bucket,
+                Key=_attachment_object_key(item.storage_name),
+            )
+        except ClientError as exc:
+            error_code = exc.response.get('Error', {}).get('Code')
+            if error_code in {'NoSuchKey', '404', 'NotFound'}:
+                raise HTTPException(status_code=404, detail='Attachment file not found') from exc
+            raise HTTPException(status_code=503, detail='Attachment storage is unavailable') from exc
+        except BotoCoreError as exc:
+            raise HTTPException(status_code=503, detail='Attachment storage is unavailable') from exc
+
+        body = stored_object['Body']
+        filename = quote(item.original_name, safe='')
+        return StreamingResponse(
+            body.iter_chunks(chunk_size=1024 * 1024),
+            media_type=item.content_type or 'application/octet-stream',
+            headers={'Content-Disposition': f"attachment; filename*=UTF-8''{filename}"},
+            background=BackgroundTask(body.close),
+        )
+
     path = (_storage_root() / item.storage_name).resolve()
     if path.parent != _storage_root() or not path.is_file():
         raise HTTPException(status_code=404, detail='Attachment file not found')
@@ -486,13 +558,18 @@ def delete_attachment(
     item = db.query(RiskAttachment).filter(RiskAttachment.id == attachment_id).first()
     if item is None or not can_access_department(current_user, item.risk.department_id):
         raise HTTPException(status_code=404, detail='Attachment not found')
-    path = (_storage_root() / item.storage_name).resolve()
     risk_id = item.risk_id
     original_name = item.original_name
+    bucket = _attachments_bucket()
+    path = None
+    if bucket:
+        _delete_s3_attachment(item.storage_name)
+    else:
+        path = (_storage_root() / item.storage_name).resolve()
     db.delete(item)
     _audit(db, current_user, 'risk_attachment_deleted', f'Attachment deleted: {original_name}', risk_id)
     db.commit()
-    if path.parent == _storage_root() and path.is_file():
+    if path is not None and path.parent == _storage_root() and path.is_file():
         path.unlink()
     return {'deleted': True}
 
